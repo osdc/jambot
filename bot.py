@@ -1,10 +1,13 @@
 import discord
-from discord import app_commands
+from discord import app_commands, guild
+from discord.app_commands.commands import describe
 from discord.ext import commands
 import os
 from dotenv import load_dotenv
 from motor.motor_asyncio import AsyncIOMotorClient
 import asyncio
+import requests
+from datetime import datetime 
 
 load_dotenv()
 
@@ -82,6 +85,78 @@ async def on_ready():
 async def on_member_join(member):
     print(f'New member joined: {member.name}')
 
+def get_commits(link: str):
+    GITHUB_TOKEN=os.getenv("PAT")
+    comps=link.split("/")
+    owner=comps[-2] 
+    repo= comps[-1]
+    COMMIT_URL=f"https://api.github.com/repos/{owner}/{repo}/commits?per_page=15"
+
+    headers = {
+        "Authorization": f"token {GITHUB_TOKEN}",
+    }
+    response = requests.get(COMMIT_URL, headers=headers)
+    try:
+        response.raise_for_status()
+    except:
+        return []
+    return response.json()
+
+def check_timestamps(link: str):
+    commits=get_commits(link)
+    if not commits:
+        return 0
+    count=0 
+    headCommitTime=datetime.fromisoformat(commits[0]["commit"]["committer"]["date"].replace("Z", "+00:00"))
+    limit= datetime.fromisoformat("2025-12-23T14:30:00+00:00")
+    if(headCommitTime>limit):
+        for commit in commits:
+            time=commit["commit"]["committer"]["date"].replace("Z", "+00:00")
+            if(datetime.fromisoformat(time)>limit):
+                count+=1
+        return count
+    else:
+        return 0
+    
+@bot.tree.command(name="githubtimestamp", description="Mentions all teams who committed after deadline", guild=discord.Object(id=serverid))
+async def githubtimestamp(interaction: discord.Interaction):
+    has_permission = await check_permission(interaction)
+
+    if not has_permission:
+        await interaction.response.send_message("You do not have permission to use this command. Only CT25/CT26 admins can use this.", ephemeral=True)
+        return
+
+    allTeams= await roles_collection.find({}).to_list(length=100)
+    try:
+        if not allTeams:
+            await interaction.response.send_message("No teams found in the database.")
+            return
+        
+        repos={}
+
+        for each in allTeams:
+            repo = each.get('githubRepo', '')
+            name= each.get('name')
+            if repo:
+                repos[name]=repo
+
+        defaulters=[]
+
+        for team in repos.keys():
+            count = await asyncio.to_thread(check_timestamps, repos[team])
+            if(count):
+                defaulters.append(team+" "+"-"+" "+str(count))
+
+        embed = discord.Embed(
+            title="Defaulters",
+            description="\n".join(defaulters)
+        )
+
+        await interaction.response.send_message(embed=embed)
+    except Exception as error:
+            print(f'Error fetching team list: {error}')
+            await interaction.response.send_message("An error occurred while fetching the team list.")
+
 @bot.tree.command(name="createteam", description="Create a new team with role and data", guild=discord.Object(id=serverid))
 @app_commands.describe(
     name="Name of the team",
@@ -153,7 +228,7 @@ async def createteam(interaction: discord.Interaction, name: str, color: str = N
                 role_color = discord.Color(int(color_hex, 16))
             except ValueError:
                 available_colors = ', '.join(['red', 'blue', 'green', 'purple', 'orange', 'pink', 'gold', 'teal', 'light blue', 'light green', 'dark blue', 'dark green'])
-                await interaction.response.send_message(
+                await interaction.followup.send(
                     f"Invalid color. Use a color name ({available_colors}) or hex code (#ff6a00)", 
                     ephemeral=True
                 )
@@ -217,7 +292,7 @@ async def setup_channels(interaction: discord.Interaction, guild: discord.Guild)
             category = await guild.create_category("CodeJam-v6")
             await interaction.followup.send("✓ Created category 'CodeJam-v6'")
         except discord.Forbidden:
-            await interaction.followup.send("❌ I don't have permission to create categories.")
+            await interaction.followup.send("I don't have permission to create categories.")
             return
 
     ct25_role = discord.utils.get(guild.roles, name="CT25")
@@ -226,12 +301,12 @@ async def setup_channels(interaction: discord.Interaction, guild: discord.Guild)
     try:
         all_teams = await roles_collection.find({}).to_list(length=100)
     except Exception as e:
-        await interaction.followup.send(f"❌ Error fetching teams from database: {e}")
+        await interaction.followup.send(f"Error fetching teams from database: {e}")
         return
 
     if not all_teams:
         await interaction.followup.send("No teams found in database.")
-        return
+        returnt
 
     text_created = 0
     text_updated = 0
@@ -459,7 +534,7 @@ async def teaminfo(interaction: discord.Interaction, view: app_commands.Choice[s
                 return
 
             embed = discord.Embed(
-                title="📋 All Teams",
+                title="All Teams",
                 description=f"Total teams: {len(all_roles)}",
                 color=0x3498db,
                 timestamp=discord.utils.utcnow()
@@ -494,7 +569,7 @@ async def teaminfo(interaction: discord.Interaction, view: app_commands.Choice[s
                 return
 
             embed = discord.Embed(
-                title=f"👥 Team: {team_name}",
+                title=f"Team: {team_name}",
                 description=f"Total members: {len(members)}",
                 color=0xff6a00,
                 timestamp=discord.utils.utcnow()
@@ -596,7 +671,7 @@ async def announce(interaction: discord.Interaction, message: str, channels: str
     await interaction.response.send_message(f"Sending announcement to {len(target_channels)} channel(s)...", ephemeral=True)
 
     embed = discord.Embed(
-        title="📢 Announcement",
+        title="Announcement",
         description=message,
         color=0xff6a00,
         timestamp=discord.utils.utcnow()
@@ -634,7 +709,7 @@ async def poll(interaction: discord.Interaction, question: str, options: str):
     emoji_numbers = ['1️⃣', '2️⃣', '3️⃣', '4️⃣', '5️⃣', '6️⃣', '7️⃣', '8️⃣', '9️⃣', '🔟']
 
     embed = discord.Embed(
-        title=f"📊 {question}",
+        title=f"{question}",
         description="React with the corresponding number to vote!",
         color=0x00ff00,
         timestamp=discord.utils.utcnow()
@@ -793,6 +868,12 @@ async def help_command(interaction: discord.Interaction):
         value="Send announcements to channels\n`message` `channels`",
         inline=False
     )
+
+    embed.add_field(
+        name="/githubtimestamp",
+        value="Mentions all teams who committed after deadline",
+        inline=False
+    )
     
     embed.add_field(
         name="/poll",
@@ -820,6 +901,11 @@ async def deleteteam(interaction: discord.Interaction, team_name: str):
     if not has_permission:
         await interaction.response.send_message("You do not have permission to use this command. Only CT25/CT26 admins can use this.", ephemeral=True)
         return
+        
+    team_exists = await roles_collection.find_one({"name": team_name})
+    if not team_exists:
+            await interaction.response.send_message(f'Team "{team_name}" does not exist. Create it first with `/createteam`.', ephemeral=True)
+            return
 
     await interaction.response.defer(ephemeral=True)
 
@@ -832,8 +918,12 @@ async def deleteteam(interaction: discord.Interaction, team_name: str):
         role = discord.utils.get(guild.roles, name=team_name)
         if role:
             await role.delete(reason=f"Team deleted by {interaction.user.name}")
-        
+        channels = discord.utils.get(guild.channels, name=team_name)
+        if channels:
+            await channels.delete(reason=f"Team deleted by {interaction.user.name}")
+
         await interaction.followup.send(f'✓ Deleted team "{team_name}" and all associated data.')
+
 
     except Exception as e:
         print(f'Error deleting team: {e}')
