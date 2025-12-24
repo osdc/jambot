@@ -1,8 +1,9 @@
 import discord
 from discord import app_commands, guild
-from discord.app_commands.commands import describe
+from discord.app_commands.commands import choices, describe
 from discord.ext import commands
-import os
+from discord.ext import tasks
+import os, json
 from dotenv import load_dotenv
 from motor.motor_asyncio import AsyncIOMotorClient
 import asyncio
@@ -11,30 +12,30 @@ from datetime import datetime
 
 load_dotenv()
 
-token = os.getenv('token')
-serverid_STR = os.getenv('serverid')
-mongouri = os.getenv('mongouri', 'mongodb://localhost:27017/codejam')
+TOKEN = os.getenv('token')
+SERVER_ID = os.getenv('serverid')
+MONGOURI = os.getenv('mongouri', 'mongodb://localhost:27017/codejam')
 
-if not token:
-    print('ERROR: token is not set in .env file')
+if not TOKEN:
+    print('ERROR: TOKEN is not set in .env file')
     exit(1)
 
-if not serverid_STR:
+if not SERVER_ID:
     print('ERROR: serverid is not set in .env file')
     exit(1)
 
 try:
-    serverid = int(serverid_STR)
+    serverid = int(SERVER_ID)
 except ValueError:
-    print(f'ERROR: serverid must be a number, got: {serverid_STR}')
+    print(f'ERROR: serverid must be a number, got: {SERVER_ID}')
     print('Make sure you replaced "your_server_id_here" with your actual server ID')
     exit(1)
 
-if not mongouri:
+if not MONGOURI:
     print('ERROR: MongoDB connection string is undefined')
     exit(1)
 
-mongo_client = AsyncIOMotorClient(mongouri)
+mongo_client = AsyncIOMotorClient(MONGOURI)
 db = mongo_client.codejam
 roles_collection = db.roles
 team_members_collection = db.team_members  
@@ -52,6 +53,8 @@ async def check_permission(interaction: discord.Interaction) -> bool:
 
 @bot.event
 async def on_ready():
+    if not github_watch_loop.is_running():
+        github_watch_loop.start()
     print(f'Logged in as {bot.user}!')
     guild = bot.get_guild(serverid)
 
@@ -85,6 +88,21 @@ async def on_ready():
 async def on_member_join(member):
     print(f'New member joined: {member.name}')
 
+CONFIG_PATH = "github_watch_config.json"
+
+def load_config():
+    if not os.path.exists(CONFIG_PATH):
+        return {"enabled": False, "last_sha": {}}
+    with open(CONFIG_PATH, "r", encoding="utf-8") as f:
+        return json.load(f)
+
+def save_config(cfg):
+    with open(CONFIG_PATH, "w", encoding="utf-8") as f:
+        json.dump(cfg, f, indent=2)
+
+cfg = load_config()
+limit= datetime.fromisoformat("2025-12-23T14:30:00+00:00")
+
 def get_commits(link: str):
     GITHUB_TOKEN=os.getenv("PAT")
     comps=link.split("/")
@@ -106,9 +124,9 @@ def check_timestamps(link: str):
     commits=get_commits(link)
     if not commits:
         return 0
+
     count=0 
     headCommitTime=datetime.fromisoformat(commits[0]["commit"]["committer"]["date"].replace("Z", "+00:00"))
-    limit= datetime.fromisoformat("2025-12-23T14:30:00+00:00")
     if(headCommitTime>limit):
         for commit in commits:
             time=commit["commit"]["committer"]["date"].replace("Z", "+00:00")
@@ -117,7 +135,89 @@ def check_timestamps(link: str):
         return count
     else:
         return 0
-    
+
+def get_late_commits(link: str, last_sha: str | None):
+    commits = get_commits(link)
+    if not commits:
+        return []
+
+    late = []
+    for commit in commits: 
+        sha = commit.get("sha")
+        if last_sha and sha == last_sha:
+            break
+
+        time = commit["commit"]["committer"]["date"].replace("Z", "+00:00")
+        commit_time = datetime.fromisoformat(time)
+        if commit_time > limit:
+            msg = commit["commit"]["message"].splitlines()[0]
+            late.append({"sha": sha, "msg": msg})
+
+    late.reverse()  
+    return late
+
+async def send_late_commits(guild: discord.Guild, team: str, late_commits: list[dict]):
+    channel = discord.utils.get(guild.text_channels, name=team)
+    if not channel:
+        return
+
+    for c in late_commits:
+        embed = discord.Embed(
+            title="ALERT",
+            description=f"You have commited beyond deadline:\n `{c['sha'][:7]}`\n" f"Commit Message: {c['msg']}",
+        )
+        await channel.send(embed=embed)
+
+@bot.tree.command(name="githubwatch",description="Toggle GitHub deadline watcher and messaging",guild=discord.Object(id=serverid))
+@app_commands.choices(action=[
+        app_commands.Choice(name="On", value="on"),
+        app_commands.Choice(name="Off", value="off"),
+    ]
+)
+async def githubwatch(interaction: discord.Interaction, action: app_commands.Choice[str]):
+    has_permission = await check_permission(interaction)
+    if not has_permission:
+        await interaction.response.send_message("You do not have permission to use this command. Only CT25/CT26 admins can use this.",ephemeral=True)
+        return
+    state = action.value
+    if state not in ["on", "off"]:
+        await interaction.response.send_message("Use: /githubwatch on OR /githubwatch off", ephemeral=True)
+        return
+    cfg["enabled"] = state == "on"
+    save_config(cfg)
+    await interaction.response.send_message(f"GitHub watcher is now {state.upper()}.", ephemeral=True)
+
+@tasks.loop(minutes=5)
+async def github_watch_loop():
+    if not cfg.get("enabled"):
+        return
+    guild = bot.get_guild(serverid)
+    if not guild:
+        return
+    allTeams = await roles_collection.find({}).to_list(length=100)
+    if not allTeams:
+        return
+
+    for each in allTeams:
+        repo = each.get("githubRepo", "")
+        name = each.get("name", "")
+        if not repo or not name:
+            continue
+
+        last_sha = cfg.get("last_sha", {}).get(name, None)
+        late_commits = await asyncio.to_thread(get_late_commits, repo, last_sha)
+
+        if late_commits:
+            try:
+                await send_late_commits(guild, name, late_commits)
+            except Exception:
+                pass
+
+        commits = await asyncio.to_thread(get_commits, repo)
+        if commits:
+            cfg.setdefault("last_sha", {})[name] = commits[0].get("sha")
+            save_config(cfg)
+
 @bot.tree.command(name="githubtimestamp", description="Mentions all teams who committed after deadline", guild=discord.Object(id=serverid))
 async def githubtimestamp(interaction: discord.Interaction):
     has_permission = await check_permission(interaction)
@@ -323,7 +423,7 @@ async def setup_channels(interaction: discord.Interaction, guild: discord.Guild)
             print(f"Role '{team_name}' not found, skipping channel creation")
             continue
 
-        channel_name = team_name.lower().replace(' ', '-')
+        channel_name = team_name
 
         overwrites = {
             guild.default_role: discord.PermissionOverwrite(read_messages=False, view_channel=False),
@@ -874,6 +974,12 @@ async def help_command(interaction: discord.Interaction):
         value="Mentions all teams who committed after deadline",
         inline=False
     )
+
+    embed.add_field(
+        name="/githubwatch",
+        value="Toggle GitHub deadline watcher and messaging",
+        inline=False
+    )
     
     embed.add_field(
         name="/poll",
@@ -918,17 +1024,21 @@ async def deleteteam(interaction: discord.Interaction, team_name: str):
         role = discord.utils.get(guild.roles, name=team_name)
         if role:
             await role.delete(reason=f"Team deleted by {interaction.user.name}")
-        channels = discord.utils.get(guild.channels, name=team_name)
-        if channels:
-            await channels.delete(reason=f"Team deleted by {interaction.user.name}")
+
+        text_channels = discord.utils.get(guild.text_channels, name=team_name)
+        if text_channels:
+            await text_channels.delete(reason=f"Team deleted by {interaction.user.name}")
+
+        voice_channels = discord.utils.get(guild.voice_channels, name=f"{team_name} Voice")
+        if voice_channels:
+            await voice_channels.delete(reason=f"Team deleted by {interaction.user.name}")
 
         await interaction.followup.send(f'✓ Deleted team "{team_name}" and all associated data.')
-
 
     except Exception as e:
         print(f'Error deleting team: {e}')
         await interaction.followup.send(f"An error occurred: {e}")
 
 if __name__ == '__main__':
-    bot.run(token)
+    bot.run(TOKEN)
 
