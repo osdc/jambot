@@ -1,14 +1,15 @@
+import asyncio
+import json
+import os
+from datetime import datetime
+
 import discord
-from discord import app_commands, guild
+import requests
+from discord import app_commands, guild, role
 from discord.app_commands.commands import choices, describe
-from discord.ext import commands
-from discord.ext import tasks
-import os, json
+from discord.ext import commands, tasks
 from dotenv import load_dotenv
 from motor.motor_asyncio import AsyncIOMotorClient
-import asyncio
-import requests
-from datetime import datetime 
 
 load_dotenv()
 
@@ -101,7 +102,7 @@ def save_config(cfg):
         json.dump(cfg, f, indent=2)
 
 cfg = load_config()
-limit= datetime.fromisoformat("2025-12-23T14:30:00+00:00")
+limit= datetime.fromisoformat("2025-12-30T18:30:00+00:00")
 
 def get_commits(link: str):
     GITHUB_TOKEN=os.getenv("PAT")
@@ -167,6 +168,24 @@ async def send_late_commits(guild: discord.Guild, team: str, late_commits: list[
             description=f"You have commited beyond deadline:\n `{c['sha'][:7]}`\n" f"Commit Message: {c['msg']}",
         )
         await channel.send(embed=embed)
+
+@bot.tree.command(name="addrepo",description="Add Github Repo dedicated for final product",guild=discord.Object(id=serverid))
+@app_commands.describe(
+    team_name="Name of your team",
+    github_repo="Github repo link of project",
+)
+async def addrepo(interaction: discord.Interaction, team_name: str, github_repo: str):
+    await interaction.response.defer(ephemeral=True)
+    has_team_role = any(r.name == team_name for r in interaction.user.roles)
+    if not has_team_role:
+        await interaction.followup.send("You do not have permission to use this command for this team name. Please use your own team name.")
+        return
+
+    await roles_collection.update_one(
+        {"name": team_name},
+        {"$set": {"githubRepo": github_repo}}
+    )
+    await interaction.followup.send(f"Saved repo for `{team_name}`: `{github_repo}`")
 
 @bot.tree.command(name="githubwatch",description="Toggle GitHub deadline watcher and messaging",guild=discord.Object(id=serverid))
 @app_commands.choices(action=[
@@ -266,6 +285,7 @@ async def githubtimestamp(interaction: discord.Interaction):
     status="Status of the team - optional"
 )
 async def createteam(interaction: discord.Interaction, name: str, color: str = None, github_repo: str = None, github_usernames: str = None, status: str = None):
+    name=name.lower()
     has_permission = await check_permission(interaction)
 
     if not has_permission:
@@ -406,7 +426,7 @@ async def setup_channels(interaction: discord.Interaction, guild: discord.Guild)
 
     if not all_teams:
         await interaction.followup.send("No teams found in database.")
-        returnt
+        return
 
     text_created = 0
     text_updated = 0
@@ -427,7 +447,16 @@ async def setup_channels(interaction: discord.Interaction, guild: discord.Guild)
 
         overwrites = {
             guild.default_role: discord.PermissionOverwrite(read_messages=False, view_channel=False),
-            team_role: discord.PermissionOverwrite(read_messages=True, send_messages=True, view_channel=True, connect=True, speak=True)
+            team_role: discord.PermissionOverwrite(read_messages=True, send_messages=True, view_channel=True, connect=True, speak=True),
+            guild.me: discord.PermissionOverwrite(
+                view_channel=True,
+                send_messages=True,
+                read_message_history=True,
+                connect=True,
+                speak=True,
+                manage_channels=True,     
+                manage_messages=True,     
+            ),
         }
 
         if ct25_role:
@@ -862,13 +891,19 @@ async def reminder(interaction: discord.Interaction, message: str, time_minutes:
 @app_commands.describe(
     action="Add or remove a member",
     team_name="Name of the team",
-    member="The Discord member"
+    member1="First member (required)",
+    member2="Second member (optional)",
+    member3="Third member (optional)",
+    member4="Fourth member (optional)",
+    member5="Fifth member (optional)",
 )
 @app_commands.choices(action=[
     app_commands.Choice(name="Add member", value="add"),
     app_commands.Choice(name="Remove member", value="remove")
 ])
-async def manage(interaction: discord.Interaction, action: app_commands.Choice[str], team_name: str, member: discord.Member):
+async def manage(interaction: discord.Interaction,action: app_commands.Choice[str],team_name: str,member1: discord.Member,member2: discord.Member | None = None,member3: discord.Member | None = None,member4: discord.Member | None = None,member5: discord.Member | None = None):
+    await interaction.response.defer(ephemeral=True)
+    members = [m for m in (member1, member2, member3, member4, member5) if m]
     has_permission = await check_permission(interaction)
 
     if not has_permission:
@@ -880,43 +915,48 @@ async def manage(interaction: discord.Interaction, action: app_commands.Choice[s
     try:
         team_exists = await roles_collection.find_one({"name": team_name})
         if not team_exists:
-            await interaction.response.send_message(f'Team "{team_name}" does not exist. Create it first with `/createteam`.', ephemeral=True)
+            await interaction.followup.send(f'Team "{team_name}" does not exist. Create it first with `/createteam`.', ephemeral=True)
             return
 
         if action_value == "add":
-            existing = await team_members_collection.find_one({
-                "team_name": team_name,
-                "discord_id": str(member.id)
-            })
+            for member in members:
+                existing = await team_members_collection.find_one({
+                    "team_name": team_name,
+                    "discord_id": str(member.id)
+                })
 
-            if existing:
-                await interaction.response.send_message(f'{member.mention} is already in team "{team_name}".', ephemeral=True)
-                return
+                if existing:
+                    await interaction.followup.send(f'{member.mention} is already in team "{team_name}".', ephemeral=True)
+                    return
 
-            member_data = {
-                "team_name": team_name,
-                "discord_id": str(member.id),
-                "discord_username": member.name,
-                "discord_display_name": member.display_name
-            }
+                member_data = {
+                    "team_name": team_name,
+                    "discord_id": str(member.id),
+                    "discord_username": member.name,
+                    "discord_display_name": member.display_name
+                }
 
-            await team_members_collection.insert_one(member_data)
-            await interaction.response.send_message(f'✓ Added {member.mention} to team "{team_name}" in database. Use `/setup action:roles` to assign Discord roles.', ephemeral=True)
-        
+                await team_members_collection.insert_one(member_data)
+                await interaction.followup.send(f'✓ Added {member.mention} to team "{team_name}" in database. Use `/setup action:roles` to assign Discord roles.', ephemeral=True)  
         else:
-            result = await team_members_collection.delete_one({
-                "team_name": team_name,
-                "discord_id": str(member.id)
-            })
+            for member in members:
+                result = await team_members_collection.delete_one({
+                    "team_name": team_name,
+                    "discord_id": str(member.id)
+                })
+                if result.deleted_count > 0:
+                    for role in member.roles:
+                        if role.name==team_name:
+                            await member.remove_roles(role)
+                            break
+                    await interaction.followup.send(f'✓ Removed {member.mention} from team "{team_name}".', ephemeral=True)
+                else:
+                    await interaction.followup.send(f'{member.mention} is not in team "{team_name}".', ephemeral=True)
 
-            if result.deleted_count > 0:
-                await interaction.response.send_message(f'✓ Removed {member.mention} from team "{team_name}".', ephemeral=True)
-            else:
-                await interaction.response.send_message(f'{member.mention} is not in team "{team_name}".', ephemeral=True)
 
     except Exception as e:
         print(f'Error managing team member: {e}')
-        await interaction.response.send_message(f"An error occurred: {e}", ephemeral=True)
+        await interaction.followup.send(f"An error occurred: {e}", ephemeral=True)
 
 @bot.tree.command(name="help", description="Show all available commands and their usage", guild=discord.Object(id=serverid))
 async def help_command(interaction: discord.Interaction):
