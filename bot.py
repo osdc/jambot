@@ -1,37 +1,42 @@
-import discord
-from discord import app_commands
-from discord.ext import commands
+import asyncio
+import json
 import os
+from datetime import datetime
+
+import discord
+import requests
+from discord import app_commands, guild, role
+from discord.app_commands.commands import choices, describe
+from discord.ext import commands, tasks
 from dotenv import load_dotenv
 from motor.motor_asyncio import AsyncIOMotorClient
-import asyncio
 
 load_dotenv()
 
-token = os.getenv('token')
-serverid_STR = os.getenv('serverid')
-mongouri = os.getenv('mongouri', 'mongodb://localhost:27017/codejam')
+TOKEN = os.getenv('token')
+SERVER_ID = os.getenv('serverid')
+MONGOURI = os.getenv('mongouri', 'mongodb://localhost:27017/codejam')
 
-if not token:
-    print('ERROR: token is not set in .env file')
+if not TOKEN:
+    print('ERROR: TOKEN is not set in .env file')
     exit(1)
 
-if not serverid_STR:
+if not SERVER_ID:
     print('ERROR: serverid is not set in .env file')
     exit(1)
 
 try:
-    serverid = int(serverid_STR)
+    serverid = int(SERVER_ID)
 except ValueError:
-    print(f'ERROR: serverid must be a number, got: {serverid_STR}')
+    print(f'ERROR: serverid must be a number, got: {SERVER_ID}')
     print('Make sure you replaced "your_server_id_here" with your actual server ID')
     exit(1)
 
-if not mongouri:
+if not MONGOURI:
     print('ERROR: MongoDB connection string is undefined')
     exit(1)
 
-mongo_client = AsyncIOMotorClient(mongouri)
+mongo_client = AsyncIOMotorClient(MONGOURI)
 db = mongo_client.codejam
 roles_collection = db.roles
 team_members_collection = db.team_members  
@@ -49,6 +54,8 @@ async def check_permission(interaction: discord.Interaction) -> bool:
 
 @bot.event
 async def on_ready():
+    if not github_watch_loop.is_running():
+        github_watch_loop.start()
     print(f'Logged in as {bot.user}!')
     guild = bot.get_guild(serverid)
 
@@ -82,6 +89,193 @@ async def on_ready():
 async def on_member_join(member):
     print(f'New member joined: {member.name}')
 
+CONFIG_PATH = "github_watch_config.json"
+
+def load_config():
+    if not os.path.exists(CONFIG_PATH):
+        return {"enabled": False, "last_sha": {}}
+    with open(CONFIG_PATH, "r", encoding="utf-8") as f:
+        return json.load(f)
+
+def save_config(cfg):
+    with open(CONFIG_PATH, "w", encoding="utf-8") as f:
+        json.dump(cfg, f, indent=2)
+
+cfg = load_config()
+limit= datetime.fromisoformat("2025-12-30T18:30:00+00:00")
+
+def get_commits(link: str):
+    GITHUB_TOKEN=os.getenv("PAT")
+    comps=link.split("/")
+    owner=comps[-2] 
+    repo= comps[-1]
+    COMMIT_URL=f"https://api.github.com/repos/{owner}/{repo}/commits?per_page=15"
+
+    headers = {
+        "Authorization": f"token {GITHUB_TOKEN}",
+    }
+    response = requests.get(COMMIT_URL, headers=headers)
+    try:
+        response.raise_for_status()
+    except:
+        return []
+    return response.json()
+
+def check_timestamps(link: str):
+    commits=get_commits(link)
+    if not commits:
+        return 0
+
+    count=0 
+    headCommitTime=datetime.fromisoformat(commits[0]["commit"]["committer"]["date"].replace("Z", "+00:00"))
+    if(headCommitTime>limit):
+        for commit in commits:
+            time=commit["commit"]["committer"]["date"].replace("Z", "+00:00")
+            if(datetime.fromisoformat(time)>limit):
+                count+=1
+        return count
+    else:
+        return 0
+
+def get_late_commits(link: str, last_sha: str | None):
+    commits = get_commits(link)
+    if not commits:
+        return []
+
+    late = []
+    for commit in commits: 
+        sha = commit.get("sha")
+        if last_sha and sha == last_sha:
+            break
+
+        time = commit["commit"]["committer"]["date"].replace("Z", "+00:00")
+        commit_time = datetime.fromisoformat(time)
+        if commit_time > limit:
+            msg = commit["commit"]["message"].splitlines()[0]
+            late.append({"sha": sha, "msg": msg})
+
+    late.reverse()  
+    return late
+
+async def send_late_commits(guild: discord.Guild, team: str, late_commits: list[dict]):
+    channel = discord.utils.get(guild.text_channels, name=team)
+    if not channel:
+        return
+
+    for c in late_commits:
+        embed = discord.Embed(
+            title="ALERT",
+            description=f"You have commited beyond deadline:\n `{c['sha'][:7]}`\n" f"Commit Message: {c['msg']}",
+        )
+        await channel.send(embed=embed)
+
+@bot.tree.command(name="addrepo",description="Add Github Repo dedicated for final product",guild=discord.Object(id=serverid))
+@app_commands.describe(
+    team_name="Name of your team",
+    github_repo="Github repo link of project",
+)
+async def addrepo(interaction: discord.Interaction, team_name: str, github_repo: str):
+    await interaction.response.defer(ephemeral=True)
+    has_team_role = any(r.name == team_name for r in interaction.user.roles)
+    if not has_team_role:
+        await interaction.followup.send("You do not have permission to use this command for this team name. Please use your own team name.")
+        return
+
+    await roles_collection.update_one(
+        {"name": team_name},
+        {"$set": {"githubRepo": github_repo}}
+    )
+    await interaction.followup.send(f"Saved repo for `{team_name}`: `{github_repo}`")
+
+@bot.tree.command(name="githubwatch",description="Toggle GitHub deadline watcher and messaging",guild=discord.Object(id=serverid))
+@app_commands.choices(action=[
+        app_commands.Choice(name="On", value="on"),
+        app_commands.Choice(name="Off", value="off"),
+    ]
+)
+async def githubwatch(interaction: discord.Interaction, action: app_commands.Choice[str]):
+    has_permission = await check_permission(interaction)
+    if not has_permission:
+        await interaction.response.send_message("You do not have permission to use this command. Only CT25/CT26 admins can use this.",ephemeral=True)
+        return
+    state = action.value
+    if state not in ["on", "off"]:
+        await interaction.response.send_message("Use: /githubwatch on OR /githubwatch off", ephemeral=True)
+        return
+    cfg["enabled"] = state == "on"
+    save_config(cfg)
+    await interaction.response.send_message(f"GitHub watcher is now {state.upper()}.", ephemeral=True)
+
+@tasks.loop(minutes=5)
+async def github_watch_loop():
+    if not cfg.get("enabled"):
+        return
+    guild = bot.get_guild(serverid)
+    if not guild:
+        return
+    allTeams = await roles_collection.find({}).to_list(length=100)
+    if not allTeams:
+        return
+
+    for each in allTeams:
+        repo = each.get("githubRepo", "")
+        name = each.get("name", "")
+        if not repo or not name:
+            continue
+
+        last_sha = cfg.get("last_sha", {}).get(name, None)
+        late_commits = await asyncio.to_thread(get_late_commits, repo, last_sha)
+
+        if late_commits:
+            try:
+                await send_late_commits(guild, name, late_commits)
+            except Exception:
+                pass
+
+        commits = await asyncio.to_thread(get_commits, repo)
+        if commits:
+            cfg.setdefault("last_sha", {})[name] = commits[0].get("sha")
+            save_config(cfg)
+
+@bot.tree.command(name="githubtimestamp", description="Mentions all teams who committed after deadline", guild=discord.Object(id=serverid))
+async def githubtimestamp(interaction: discord.Interaction):
+    has_permission = await check_permission(interaction)
+
+    if not has_permission:
+        await interaction.response.send_message("You do not have permission to use this command. Only CT25/CT26 admins can use this.", ephemeral=True)
+        return
+
+    allTeams= await roles_collection.find({}).to_list(length=100)
+    try:
+        if not allTeams:
+            await interaction.response.send_message("No teams found in the database.")
+            return
+        
+        repos={}
+
+        for each in allTeams:
+            repo = each.get('githubRepo', '')
+            name= each.get('name')
+            if repo:
+                repos[name]=repo
+
+        defaulters=[]
+
+        for team in repos.keys():
+            count = await asyncio.to_thread(check_timestamps, repos[team])
+            if(count):
+                defaulters.append(team+" "+"-"+" "+str(count))
+
+        embed = discord.Embed(
+            title="Defaulters",
+            description="\n".join(defaulters)
+        )
+
+        await interaction.response.send_message(embed=embed)
+    except Exception as error:
+            print(f'Error fetching team list: {error}')
+            await interaction.response.send_message("An error occurred while fetching the team list.")
+
 @bot.tree.command(name="createteam", description="Create a new team with role and data", guild=discord.Object(id=serverid))
 @app_commands.describe(
     name="Name of the team",
@@ -91,6 +285,7 @@ async def on_member_join(member):
     status="Status of the team - optional"
 )
 async def createteam(interaction: discord.Interaction, name: str, color: str = None, github_repo: str = None, github_usernames: str = None, status: str = None):
+    name=name.lower()
     has_permission = await check_permission(interaction)
 
     if not has_permission:
@@ -153,7 +348,7 @@ async def createteam(interaction: discord.Interaction, name: str, color: str = N
                 role_color = discord.Color(int(color_hex, 16))
             except ValueError:
                 available_colors = ', '.join(['red', 'blue', 'green', 'purple', 'orange', 'pink', 'gold', 'teal', 'light blue', 'light green', 'dark blue', 'dark green'])
-                await interaction.response.send_message(
+                await interaction.followup.send(
                     f"Invalid color. Use a color name ({available_colors}) or hex code (#ff6a00)", 
                     ephemeral=True
                 )
@@ -217,7 +412,7 @@ async def setup_channels(interaction: discord.Interaction, guild: discord.Guild)
             category = await guild.create_category("CodeJam-v6")
             await interaction.followup.send("✓ Created category 'CodeJam-v6'")
         except discord.Forbidden:
-            await interaction.followup.send("❌ I don't have permission to create categories.")
+            await interaction.followup.send("I don't have permission to create categories.")
             return
 
     ct25_role = discord.utils.get(guild.roles, name="CT25")
@@ -226,7 +421,7 @@ async def setup_channels(interaction: discord.Interaction, guild: discord.Guild)
     try:
         all_teams = await roles_collection.find({}).to_list(length=100)
     except Exception as e:
-        await interaction.followup.send(f"❌ Error fetching teams from database: {e}")
+        await interaction.followup.send(f"Error fetching teams from database: {e}")
         return
 
     if not all_teams:
@@ -248,11 +443,20 @@ async def setup_channels(interaction: discord.Interaction, guild: discord.Guild)
             print(f"Role '{team_name}' not found, skipping channel creation")
             continue
 
-        channel_name = team_name.lower().replace(' ', '-')
+        channel_name = team_name
 
         overwrites = {
             guild.default_role: discord.PermissionOverwrite(read_messages=False, view_channel=False),
-            team_role: discord.PermissionOverwrite(read_messages=True, send_messages=True, view_channel=True, connect=True, speak=True)
+            team_role: discord.PermissionOverwrite(read_messages=True, send_messages=True, view_channel=True, connect=True, speak=True),
+            guild.me: discord.PermissionOverwrite(
+                view_channel=True,
+                send_messages=True,
+                read_message_history=True,
+                connect=True,
+                speak=True,
+                manage_channels=True,     
+                manage_messages=True,     
+            ),
         }
 
         if ct25_role:
@@ -459,7 +663,7 @@ async def teaminfo(interaction: discord.Interaction, view: app_commands.Choice[s
                 return
 
             embed = discord.Embed(
-                title="📋 All Teams",
+                title="All Teams",
                 description=f"Total teams: {len(all_roles)}",
                 color=0x3498db,
                 timestamp=discord.utils.utcnow()
@@ -494,7 +698,7 @@ async def teaminfo(interaction: discord.Interaction, view: app_commands.Choice[s
                 return
 
             embed = discord.Embed(
-                title=f"👥 Team: {team_name}",
+                title=f"Team: {team_name}",
                 description=f"Total members: {len(members)}",
                 color=0xff6a00,
                 timestamp=discord.utils.utcnow()
@@ -596,7 +800,7 @@ async def announce(interaction: discord.Interaction, message: str, channels: str
     await interaction.response.send_message(f"Sending announcement to {len(target_channels)} channel(s)...", ephemeral=True)
 
     embed = discord.Embed(
-        title="📢 Announcement",
+        title="Announcement",
         description=message,
         color=0xff6a00,
         timestamp=discord.utils.utcnow()
@@ -634,7 +838,7 @@ async def poll(interaction: discord.Interaction, question: str, options: str):
     emoji_numbers = ['1️⃣', '2️⃣', '3️⃣', '4️⃣', '5️⃣', '6️⃣', '7️⃣', '8️⃣', '9️⃣', '🔟']
 
     embed = discord.Embed(
-        title=f"📊 {question}",
+        title=f"{question}",
         description="React with the corresponding number to vote!",
         color=0x00ff00,
         timestamp=discord.utils.utcnow()
@@ -687,13 +891,19 @@ async def reminder(interaction: discord.Interaction, message: str, time_minutes:
 @app_commands.describe(
     action="Add or remove a member",
     team_name="Name of the team",
-    member="The Discord member"
+    member1="First member (required)",
+    member2="Second member (optional)",
+    member3="Third member (optional)",
+    member4="Fourth member (optional)",
+    member5="Fifth member (optional)",
 )
 @app_commands.choices(action=[
     app_commands.Choice(name="Add member", value="add"),
     app_commands.Choice(name="Remove member", value="remove")
 ])
-async def manage(interaction: discord.Interaction, action: app_commands.Choice[str], team_name: str, member: discord.Member):
+async def manage(interaction: discord.Interaction,action: app_commands.Choice[str],team_name: str,member1: discord.Member,member2: discord.Member | None = None,member3: discord.Member | None = None,member4: discord.Member | None = None,member5: discord.Member | None = None):
+    await interaction.response.defer(ephemeral=True)
+    members = [m for m in (member1, member2, member3, member4, member5) if m]
     has_permission = await check_permission(interaction)
 
     if not has_permission:
@@ -705,43 +915,48 @@ async def manage(interaction: discord.Interaction, action: app_commands.Choice[s
     try:
         team_exists = await roles_collection.find_one({"name": team_name})
         if not team_exists:
-            await interaction.response.send_message(f'Team "{team_name}" does not exist. Create it first with `/createteam`.', ephemeral=True)
+            await interaction.followup.send(f'Team "{team_name}" does not exist. Create it first with `/createteam`.', ephemeral=True)
             return
 
         if action_value == "add":
-            existing = await team_members_collection.find_one({
-                "team_name": team_name,
-                "discord_id": str(member.id)
-            })
+            for member in members:
+                existing = await team_members_collection.find_one({
+                    "team_name": team_name,
+                    "discord_id": str(member.id)
+                })
 
-            if existing:
-                await interaction.response.send_message(f'{member.mention} is already in team "{team_name}".', ephemeral=True)
-                return
+                if existing:
+                    await interaction.followup.send(f'{member.mention} is already in team "{team_name}".', ephemeral=True)
+                    return
 
-            member_data = {
-                "team_name": team_name,
-                "discord_id": str(member.id),
-                "discord_username": member.name,
-                "discord_display_name": member.display_name
-            }
+                member_data = {
+                    "team_name": team_name,
+                    "discord_id": str(member.id),
+                    "discord_username": member.name,
+                    "discord_display_name": member.display_name
+                }
 
-            await team_members_collection.insert_one(member_data)
-            await interaction.response.send_message(f'✓ Added {member.mention} to team "{team_name}" in database. Use `/setup action:roles` to assign Discord roles.', ephemeral=True)
-        
+                await team_members_collection.insert_one(member_data)
+                await interaction.followup.send(f'✓ Added {member.mention} to team "{team_name}" in database. Use `/setup action:roles` to assign Discord roles.', ephemeral=True)  
         else:
-            result = await team_members_collection.delete_one({
-                "team_name": team_name,
-                "discord_id": str(member.id)
-            })
+            for member in members:
+                result = await team_members_collection.delete_one({
+                    "team_name": team_name,
+                    "discord_id": str(member.id)
+                })
+                if result.deleted_count > 0:
+                    for role in member.roles:
+                        if role.name==team_name:
+                            await member.remove_roles(role)
+                            break
+                    await interaction.followup.send(f'✓ Removed {member.mention} from team "{team_name}".', ephemeral=True)
+                else:
+                    await interaction.followup.send(f'{member.mention} is not in team "{team_name}".', ephemeral=True)
 
-            if result.deleted_count > 0:
-                await interaction.response.send_message(f'✓ Removed {member.mention} from team "{team_name}".', ephemeral=True)
-            else:
-                await interaction.response.send_message(f'{member.mention} is not in team "{team_name}".', ephemeral=True)
 
     except Exception as e:
         print(f'Error managing team member: {e}')
-        await interaction.response.send_message(f"An error occurred: {e}", ephemeral=True)
+        await interaction.followup.send(f"An error occurred: {e}", ephemeral=True)
 
 @bot.tree.command(name="help", description="Show all available commands and their usage", guild=discord.Object(id=serverid))
 async def help_command(interaction: discord.Interaction):
@@ -793,6 +1008,18 @@ async def help_command(interaction: discord.Interaction):
         value="Send announcements to channels\n`message` `channels`",
         inline=False
     )
+
+    embed.add_field(
+        name="/githubtimestamp",
+        value="Mentions all teams who committed after deadline",
+        inline=False
+    )
+
+    embed.add_field(
+        name="/githubwatch",
+        value="Toggle GitHub deadline watcher and messaging",
+        inline=False
+    )
     
     embed.add_field(
         name="/poll",
@@ -820,6 +1047,11 @@ async def deleteteam(interaction: discord.Interaction, team_name: str):
     if not has_permission:
         await interaction.response.send_message("You do not have permission to use this command. Only CT25/CT26 admins can use this.", ephemeral=True)
         return
+        
+    team_exists = await roles_collection.find_one({"name": team_name})
+    if not team_exists:
+            await interaction.response.send_message(f'Team "{team_name}" does not exist. Create it first with `/createteam`.', ephemeral=True)
+            return
 
     await interaction.response.defer(ephemeral=True)
 
@@ -832,7 +1064,15 @@ async def deleteteam(interaction: discord.Interaction, team_name: str):
         role = discord.utils.get(guild.roles, name=team_name)
         if role:
             await role.delete(reason=f"Team deleted by {interaction.user.name}")
-        
+
+        text_channels = discord.utils.get(guild.text_channels, name=team_name)
+        if text_channels:
+            await text_channels.delete(reason=f"Team deleted by {interaction.user.name}")
+
+        voice_channels = discord.utils.get(guild.voice_channels, name=f"{team_name} Voice")
+        if voice_channels:
+            await voice_channels.delete(reason=f"Team deleted by {interaction.user.name}")
+
         await interaction.followup.send(f'✓ Deleted team "{team_name}" and all associated data.')
 
     except Exception as e:
@@ -840,5 +1080,5 @@ async def deleteteam(interaction: discord.Interaction, team_name: str):
         await interaction.followup.send(f"An error occurred: {e}")
 
 if __name__ == '__main__':
-    bot.run(token)
+    bot.run(TOKEN)
 
